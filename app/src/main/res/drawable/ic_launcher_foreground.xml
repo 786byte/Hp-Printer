@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A printer with a sheet coming out, inside the 66dp adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFF" android:pathData="M40,30h28v12h-28z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M32,44h44a4,4 0 0 1 4,4v18a4,4 0 0 1 -4,4h-6v-8h-32v8h-6a4,4 0 0 1 -4,-4v-18a4,4 0 0 1 4,-4z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M42,64h24v16h-24z" />
+    <path android:fillColor="#1F5FAD" android:pathData="M46,69h16v2h-16zM46,74h11v2h-11z" />
+    <path android:fillColor="#00B8D9" android:pathData="M68,50m-2.5,0a2.5,2.5 0 1 0 5,0a2.5,2.5 0 1 0 -5,0" />
+</vector>
