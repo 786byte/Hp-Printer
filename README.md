@@ -52,11 +52,22 @@ and no cloud.
 - Keeps printing when you switch to another app
 - Interrupted jobs (app closed mid-print) are marked in history and can be retried
 
-## Install
+## Install on your phone
 
-Every push builds the app on GitHub Actions. Open the repository's **Actions** tab → latest *Build APK* run →
-download **JustPrintIt-apk**, unzip, and install `app-release.apk` on your phone (allow "install unknown apps"
-for your browser or file manager). Android 8.0 or newer.
+1. On your Android phone, open **https://github.com/786byte/Hp-Printer/releases/latest**
+2. Tap **JustPrintIt.apk** to download it.
+3. Open the download. If Android says installing from this source isn't allowed, tap **Settings**, turn on
+   **Allow from this source**, then go back and tap **Install**.
+4. Open **Just Print It** from your app drawer. It finds the printer on your Wi-Fi.
+
+Needs Android 8.0 or newer. Every push builds a new release; installing it updates the app and keeps your
+settings and page counters (all versions are signed with the same key).
+
+Google Play Protect may warn that the app is from an unknown developer — that's normal for apps not installed
+from the Play Store. Choose **Install anyway**.
+
+The signing key (`app/justprintit.jks`) is in the repository so builds are always signed the same way. Only
+install APKs from this repository's Releases page.
 
 ## Build it yourself
 

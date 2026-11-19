@@ -12,8 +12,21 @@ android {
         applicationId = "com.justprintit.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // CI passes the run number so every build is a newer version and installs as an update.
+        val build = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+        versionCode = build
+        versionName = "1.0.$build"
+    }
+
+    signingConfigs {
+        // A fixed key, so each new APK installs over the previous one and keeps your counters and settings.
+        // It's in the repo for convenience; to use a private key instead, set the KEYSTORE_* environment variables.
+        create("release") {
+            storeFile = file(System.getenv("KEYSTORE_FILE") ?: "justprintit.jks")
+            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "justprintit"
+            keyAlias = System.getenv("KEY_ALIAS") ?: "justprintit"
+            keyPassword = System.getenv("KEY_PASSWORD") ?: "justprintit"
+        }
     }
 
     buildTypes {
@@ -21,8 +34,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Signed with the debug key so the release APK installs straight from GitHub. Use your own key for Play.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {

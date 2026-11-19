@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,12 +21,29 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Test printer logic
         run: ./gradlew :core:test
-      - name: Build APKs
-        run: ./gradlew :app:assembleDebug :app:assembleRelease
+      - name: Build APK
+        run: ./gradlew :app:assembleRelease
+      - name: Check the APK is installable
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          APK=app/build/outputs/apk/release/app-release.apk
+          $BT/apksigner verify --print-certs $APK
+          $BT/aapt2 dump badging $APK | grep -E "^(package|sdkVersion|targetSdkVersion|application-label|launchable-activity)"
+          cp $APK JustPrintIt.apk
       - uses: actions/upload-artifact@v4
         with:
           name: JustPrintIt-apk
-          path: |
-            app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/debug/*.apk
+          path: JustPrintIt.apk
           if-no-files-found: error
+      - name: Publish release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Just Print It 1.0.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: JustPrintIt.apk
+          body: |
+            **Install on your phone:** tap `JustPrintIt.apk` below, open it, and allow installing from your browser if Android asks.
+            New versions install over the old one and keep your settings and page counters.
