@@ -23,6 +23,11 @@ import android.print.PrintJob
 import android.print.PrintJobInfo
 import android.print.PrintManager
 import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.Typeface
+import android.graphics.pdf.PdfDocument
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -45,7 +50,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class MainActivity : Activity() {
+class MainActivity : Activity(), PrintQueue.Listener {
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var prefs: SharedPreferences
     private lateinit var disc: Discovery
@@ -56,7 +61,6 @@ class MainActivity : Activity() {
     private val scans = ArrayList<ByteArray>()
     private var foundListener: ((String, String) -> Unit)? = null
     private var detectedPaper: Paper? = null
-    private val capsCache = HashMap<String, Caps>()
 
     private lateinit var root: LinearLayout
     private lateinit var printerTv: TextView
@@ -87,6 +91,14 @@ class MainActivity : Activity() {
     private lateinit var scanDpiSp: Spinner
     private lateinit var scanBtn: Button
     private lateinit var scanInfo: TextView
+    private lateinit var turnCb: CheckBox
+    private lateinit var queueSummary: TextView
+    private lateinit var queueBar: ProgressBar
+    private lateinit var queueList: LinearLayout
+    private lateinit var queueStartBtn: Button
+    private var decisionDlg: AlertDialog? = null
+    /** True while a guided double-sided job runs: it must print one copy so fronts and backs stay in step. */
+    private var guidedActive = false
 
     private val papers = Paper.values()
     private val nups = intArrayOf(1, 2, 3, 4, 6, 9)
@@ -112,11 +124,16 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        PrintQueue.listener = this
+        renderQueue()
+        PrintQueue.waitingFor?.let { showDecision(it) }
         refreshInk()
     }
 
     override fun onDestroy() {
         disc.stop()
+        if (PrintQueue.listener === this) PrintQueue.listener = null
+        decisionDlg?.dismiss()
         super.onDestroy()
     }
 
@@ -290,12 +307,34 @@ class MainActivity : Activity() {
             button("Double-sided") { preset(mode = 3) }
         ))
 
+        turnCb = CheckBox(this)
+        turnCb.text = "Turn back sides upside down (set this with the test page)"
+        turnCb.isChecked = prefs.getBoolean("turnBacks", false)
+        turnCb.setOnCheckedChangeListener { _, v -> prefs.edit().putBoolean("turnBacks", v).apply() }
+        cc.addView(turnCb)
+        cc.addView(button("Print a double-sided test (4 pages)") { duplexTest() })
+
         printBtn = button("Print", true) { doPrint() }
         val plp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         plp.topMargin = dp(8)
         cc.addView(printBtn, plp)
+        cc.addView(button("Add to queue (one job per file)") { addToQueue() })
         cc.addView(label("\"Direct to printer\" sends the job itself over Wi-Fi, so it works with mobile data on " +
             "and shows real progress. If a job fails, the app asks you before trying again.", 12f, grey))
+
+        // Queue
+        val qc = card("Print queue")
+        queueSummary = label("", 14f)
+        qc.addView(queueSummary)
+        queueBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        qc.addView(queueBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10)))
+        queueList = LinearLayout(this)
+        queueList.orientation = LinearLayout.VERTICAL
+        qc.addView(queueList)
+        queueStartBtn = button("Start", true) { toggleQueue() }
+        qc.addView(row(queueStartBtn, button("Clear finished") { PrintQueue.clearFinished() }))
+        qc.addView(label("Jobs print one after another. If one fails or the app can't tell whether it printed, " +
+            "the queue stops and asks you — it never retries by itself.", 12f, grey))
 
         // History
         val hc = card("Pages printed from this app")
@@ -627,7 +666,7 @@ class MainActivity : Activity() {
     private fun updFiles() {
         filesTv.text = if (uris.isEmpty()) "Nothing chosen."
         else uris.size.toString() + " file" + (if (uris.size == 1) "" else "s") + " ready: " +
-            uris.joinToString(", ") { it.lastPathSegment?.substringAfterLast('/') ?: "file" }
+            uris.joinToString(", ") { nameOf(it) }
         detectSize()
     }
 
@@ -671,7 +710,8 @@ class MainActivity : Activity() {
             pages = 0,
             evenRev = evenSp.selectedItemPosition == 0,
             shortEdge = flipSp.selectedItemPosition == 1,
-            evenPad = false
+            evenPad = false,
+            turnBacks = turnCb.isChecked
         )
     }
 
@@ -703,6 +743,7 @@ class MainActivity : Activity() {
         prefs.edit().putInt("send", sendSp.selectedItemPosition).apply()
         val list = ArrayList(uris)
         val base = readOpts()
+        guidedActive = modeSp.selectedItemPosition == 3
         when (modeSp.selectedItemPosition) {
             0 -> runJob(list, base, "") { }
             1 -> runJob(list, base.copy(pages = 1), "odd pages") { }
@@ -721,18 +762,20 @@ class MainActivity : Activity() {
             AlertDialog.Builder(this)
                 .setTitle("Side 1 printed")
                 .setMessage(
-                    "Take the printed pages out and put them back in the paper tray so the BLANK sides get printed. " +
-                        "Keep the pages in the same order.\n\n" +
-                        "First time? Test with a 4-page PDF. If page 2 comes out upside down, change \"Flip edge\"; " +
-                        "if the backs are on the wrong sheets, change \"Even-page order\"."
+                    "1. Take the printed pages out of the output tray. Keep them in the same order.\n" +
+                        "2. Put the stack back in the paper tray so the BLANK sides get printed. Don't turn it around.\n" +
+                        "3. Slide the paper guides against the stack.\n\n" +
+                        "First time? Use \"Print a double-sided test\". If the backs come out upside down, tick " +
+                        "\"Turn back sides upside down\"; if they land on the wrong sheets, change \"Even-page order\"."
                 )
                 .setCancelable(false)
                 .setPositiveButton("Print other side") { _, _ ->
                     runJob(list, base.copy(pages = 2, evenPad = true), "side 2 of 2") {
                         statusTv.text = "Double-sided print finished ✓"
+                        guidedActive = false
                     }
                 }
-                .setNegativeButton("Stop here") { _, _ -> statusTv.text = "Stopped after side 1" }
+                .setNegativeButton("Stop here") { _, _ -> statusTv.text = "Stopped after side 1"; guidedActive = false }
                 .show()
         }
     }
@@ -746,166 +789,61 @@ class MainActivity : Activity() {
 
     private fun readCopies() = (copiesEt.text.toString().toIntOrNull() ?: 1).coerceIn(1, 99)
 
-    private class NoDirect : Exception()
-
     // ---------- direct to printer (IPP over Wi-Fi)
 
     private fun runDirect(list: List<Uri>, o: Opts, what: String, onDone: (Int) -> Unit) {
         val tag = tagOf(what)
         val target = ip
-        val copies = readCopies()
+        // Guided double-sided must keep fronts and backs in step, so it prints one copy.
+        val copies = if (guidedActive) 1 else readCopies()
         val det = detectedPaper
         val quality = intArrayOf(3, 4, 5)[qualSp.selectedItemPosition]
         val retry = { runDirect(list, o, what, onDone) }
         printBtn.isEnabled = false
         statusTv.text = "Preparing…$tag"
         bg {
-            var prep: Prepared? = null
-            try {
-                val net = Net.wifi(this)
-                val caps = capsCache[target] ?: Ipp.caps(target, net).also { capsCache[target] = it }
-                val p = PdfTools.prepare(this, list, o)
-                prep = p
-                cacheDir.listFiles()?.forEach { if (it.name.startsWith("job_")) it.delete() }
-                val orig = p.original
-                val file: File
-                val format: String
-                val raster: Boolean
-                val sendCopies: Int
-                if (orig != null && caps.formats.contains("application/pdf") && det == o.paper && !o.landscape) {
-                    file = orig
-                    format = "application/pdf"
-                    raster = false
-                    sendCopies = copies
-                } else {
-                    val pwg = caps.formats.contains("image/pwg-raster")
-                    if (!pwg && !caps.formats.contains("image/urf")) throw NoDirect()
-                    val dpi: Int
-                    val grayOk: Boolean
-                    if (pwg) {
-                        dpi = if (caps.pwgRes.contains(300) || caps.pwgRes.isEmpty()) 300 else caps.pwgRes.min()
-                        grayOk = caps.pwgTypes.any { it.startsWith("sgray_8") }
-                    } else {
-                        val rs = caps.urf.firstOrNull { it.startsWith("RS") }
-                            ?.removePrefix("RS")?.split("-")?.mapNotNull { it.toIntOrNull() } ?: emptyList()
-                        dpi = if (rs.contains(300) || rs.isEmpty()) 300 else rs.min()
-                        grayOk = caps.urf.contains("W8")
-                    }
-                    file = File(cacheDir, "job_" + System.currentTimeMillis() + if (pwg) ".pwg" else ".urf")
-                    PdfTools.writeRaster(p, file, pwg, dpi, o.gray && grayOk, quality, copies, o.paper.media) { i, n ->
-                        ui.post { statusTv.text = "Preparing page $i / $n…$tag" }
-                    }
-                    format = if (pwg) "image/pwg-raster" else "image/urf"
-                    raster = true
-                    sendCopies = 1
-                }
-                ui.post { statusTv.text = "Sending to printer…$tag" }
-                val id = Ipp.printJob(target, net, file, format, "Quick Print " + stamp(),
-                    sendCopies, o.paper.media, !o.gray, quality, raster)
-                val res = BuildResult(p.order.size, p.total)
-                ui.post {
-                    printBtn.isEnabled = true
-                    track(target, id, res.printed * copies, !o.gray, tag, { onDone(res.total) }, retry)
-                }
-            } catch (e: NoDirect) {
-                ui.post {
-                    printBtn.isEnabled = true
-                    toast("This printer doesn't take direct jobs. Using the Android print screen.")
-                    runAndroid(list, o, what, onDone)
-                }
-            } catch (e: Throwable) {
-                ui.post {
-                    printBtn.isEnabled = true
-                    statusTv.text = "Couldn't send$tag"
-                    AlertDialog.Builder(this)
-                        .setTitle("Couldn't send to the printer")
-                        .setMessage((e.message ?: e.javaClass.simpleName) + "\n\n" +
-                            "Check that the printer is on and your phone is connected to its Wi-Fi. Nothing was printed or counted.")
-                        .setCancelable(false)
-                        .setPositiveButton("Try again") { _, _ -> retry() }
-                        .setNeutralButton("Use print screen") { _, _ -> runAndroid(list, o, what, onDone) }
-                        .setNegativeButton("Cancel") { _, _ -> statusTv.text = "Print cancelled" }
-                        .show()
-                }
-            } finally {
-                prep?.close()
+            val out = DirectPrint.run(this, target, list, o, copies, quality, det, "Quick Print " + stamp()) { m ->
+                ui.post { statusTv.text = m + tag }
             }
-        }
-    }
-
-    private fun nice(reasons: List<String>): String {
-        val r = reasons.map { it.removeSuffix("-report").removeSuffix("-warning").removeSuffix("-error") }
-            .filter { it != "none" && !it.startsWith("job-") && it != "processing-to-stop-point" }
-            .map {
-                when {
-                    it.startsWith("media-empty") || it == "media-needed" -> "out of paper"
-                    it.startsWith("media-jam") -> "paper jam"
-                    it.startsWith("marker-supply") -> "ink low or empty"
-                    it.contains("door-open") || it.contains("cover-open") -> "cover or door open"
-                    else -> it.replace("-", " ")
-                }
-            }.distinct()
-        return if (r.isEmpty()) "needs attention" else r.joinToString(", ")
-    }
-
-    /** Follows a direct job until the printer says it's done. Asks you whenever the result is unclear. */
-    private fun track(target: String, id: Int, pages: Int, color: Boolean, tag: String, onDone: () -> Unit, retry: () -> Unit) {
-        val finish = {
-            Stats.add(this, pages, color)
-            updStats()
-            statusTv.text = "Printed ✓$tag"
-            refreshInk()
-            onDone()
-        }
-        if (id <= 0) {
-            statusTv.text = "Sent$tag"
-            ui.postDelayed({ askDidItPrint(tag, finish, retry) }, 20000)
-            return
-        }
-        bg {
-            var seenPrinting = false
-            var fails = 0
-            while (true) {
-                Thread.sleep(1500)
-                val st = try {
-                    Ipp.jobState(target, Net.wifi(this), id).also { fails = 0 }
-                } catch (e: Exception) {
-                    fails++
-                    null
-                }
-                if (st == null) {
-                    if (fails >= 12) {
-                        ui.post { askDidItPrint(tag, finish, retry) }
-                        return@bg
+            ui.post {
+                printBtn.isEnabled = true
+                when (out) {
+                    is Outcome.Done -> finishJob(out.sheets, out.color, tag) { onDone(out.total) }
+                    is Outcome.Unclear -> askDidItPrint(tag, out.why, { finishJob(out.sheets, out.color, tag) { onDone(out.total) } }, retry)
+                    is Outcome.Cancelled -> statusTv.text = "Cancelled on the printer$tag"
+                    is Outcome.NoDirect -> {
+                        toast("This printer doesn't take direct jobs. Using the Android print screen.")
+                        runAndroid(list, o, what, onDone)
                     }
-                    ui.post { statusTv.text = "Checking the printer…$tag" }
-                    continue
-                }
-                when (st.state) {
-                    9 -> { ui.post { finish() }; return@bg }
-                    -1 -> {
-                        ui.post { if (seenPrinting) finish() else askDidItPrint(tag, finish, retry) }
-                        return@bg
-                    }
-                    7 -> { ui.post { statusTv.text = "Cancelled on the printer$tag" }; return@bg }
-                    8 -> {
-                        ui.post { askFailed(tag, nice(st.reasons), retry) }
-                        return@bg
-                    }
-                    6 -> ui.post { statusTv.text = "Printer paused: ${nice(st.reasons)}. Fix it and printing continues.$tag" }
-                    5 -> { seenPrinting = true; ui.post { statusTv.text = "Printing…$tag" } }
-                    else -> ui.post { statusTv.text = "Waiting in the printer's queue…$tag" }
+                    is Outcome.Failed -> if (out.nothingSent) {
+                        statusTv.text = "Couldn't send$tag"
+                        AlertDialog.Builder(this)
+                            .setTitle("Couldn't print")
+                            .setMessage(out.why + "\n\nNothing was printed or counted.")
+                            .setCancelable(false)
+                            .setPositiveButton("Try again") { _, _ -> retry() }
+                            .setNeutralButton("Use print screen") { _, _ -> runAndroid(list, o, what, onDone) }
+                            .setNegativeButton("Cancel") { _, _ -> statusTv.text = "Print cancelled" }
+                            .show()
+                    } else askFailed(tag, out.why, retry)
                 }
             }
         }
     }
 
-    private fun askDidItPrint(tag: String, finish: () -> Unit, retry: () -> Unit) {
+    private fun finishJob(sheets: Int, color: Boolean, tag: String, then: () -> Unit) {
+        Stats.add(this, sheets, color)
+        updStats()
+        statusTv.text = "Printed ✓$tag"
+        refreshInk()
+        then()
+    }
+
+    private fun askDidItPrint(tag: String, why: String, finish: () -> Unit, retry: () -> Unit) {
         statusTv.text = "Not sure if it printed$tag"
         AlertDialog.Builder(this)
             .setTitle("Did it print?")
-            .setMessage("The printer stopped reporting on this job$tag, so the app can't tell whether it finished.\n\n" +
-                "Did all the pages come out correctly?")
+            .setMessage("$why\n\nThe app can't tell whether this job$tag finished. Did all the pages come out correctly?")
             .setCancelable(false)
             .setPositiveButton("Yes") { _, _ -> finish() }
             .setNeutralButton("No, print again") { _, _ -> retry() }
@@ -917,7 +855,7 @@ class MainActivity : Activity() {
         statusTv.text = "Print failed$tag"
         AlertDialog.Builder(this)
             .setTitle("Print failed")
-            .setMessage("The printer stopped this job$tag ($why). Nothing has been counted.\n\nTry again?")
+            .setMessage("$why\n\nThis job$tag was not counted. Check the output tray before trying again.\n\nTry again?")
             .setCancelable(false)
             .setPositiveButton("Try again") { _, _ -> retry() }
             .setNegativeButton("Cancel") { _, _ -> statusTv.text = "Print cancelled" }
@@ -937,7 +875,7 @@ class MainActivity : Activity() {
                 cacheDir.listFiles()?.forEach { if (it.name.startsWith("job_")) it.delete() }
                 val out = File(cacheDir, "job_" + System.currentTimeMillis() + ".pdf")
                 PdfTools.writePdf(p, out) { i, n -> ui.post { statusTv.text = "Preparing $i / $n…" } }
-                val res = BuildResult(p.order.size, p.total)
+                val res = BuildResult(p.order.count { it >= 0 }, p.total)
                 ui.post {
                     printBtn.isEnabled = true
                     submit(out, res, o, what, onDone)
@@ -1011,7 +949,7 @@ class MainActivity : Activity() {
                     job.isFailed -> askFailed(tag, "the print service reported an error", retry)
                     job.isCancelled -> statusTv.text = "Print cancelled$tag"
                     state != PrintJobInfo.STATE_CREATED && System.currentTimeMillis() - lastChange > 90000 ->
-                        askDidItPrint(tag, finish, retry)
+                        askDidItPrint(tag, "The print service hasn't reported progress for 90 seconds.", finish, retry)
                     else -> {
                         statusTv.text = when {
                             job.isBlocked -> "Printer needs attention: paper, ink or cover?$tag"
@@ -1061,6 +999,212 @@ class MainActivity : Activity() {
                 callback.onWriteFailed(e.message)
             }
         }
+    }
+
+    // ---------------------------------------------------------------- file names
+
+    private fun nameOf(u: Uri): String {
+        val n = try {
+            contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                if (it.moveToFirst()) it.getString(0) else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+        return n ?: u.lastPathSegment?.substringAfterLast('/') ?: "file"
+    }
+
+    // ---------------------------------------------------------------- double-sided test
+
+    /** Prints a 4-page test through the guided double-sided flow, so you can see how your printer flips paper. */
+    private fun duplexTest() {
+        val f = File(cacheDir, "duplex_test.pdf")
+        val doc = PdfDocument()
+        try {
+            val big = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 160f; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER }
+            val mid = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 30f; textAlign = Paint.Align.CENTER }
+            val small = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 16f; textAlign = Paint.Align.CENTER; color = Color.DKGRAY }
+            for (n in 1..4) {
+                val pg = doc.startPage(PdfDocument.PageInfo.Builder(595, 842, n).create())
+                val c = pg.canvas
+                c.drawPath(Path().apply { moveTo(297f, 70f); lineTo(237f, 160f); lineTo(357f, 160f); close() }, mid)
+                c.drawRect(282f, 160f, 312f, 260f, mid)
+                c.drawText("TOP", 297f, 300f, mid)
+                c.drawText("$n", 297f, 520f, big)
+                c.drawText(if (n % 2 == 1) "front of sheet ${(n + 1) / 2}" else "back of sheet ${n / 2}", 297f, 580f, mid)
+                c.drawText("Correct when: page 2 is on the back of page 1, page 4 on the back of page 3,", 297f, 700f, small)
+                c.drawText("and both sides have the arrow at the same edge (flip like a book).", 297f, 722f, small)
+                doc.finishPage(pg)
+            }
+            f.outputStream().use { doc.writeTo(it) }
+        } finally {
+            doc.close()
+        }
+        uris.clear()
+        uris.add(Uri.fromFile(f))
+        updFiles()
+        modeSp.setSelection(3)
+        nupSp.setSelection(0)
+        flipSp.setSelection(0)
+        grayCb.isChecked = true
+        qualSp.setSelection(0)
+        rangeEt.setText("")
+        toast("Test loaded. Load 2 sheets of plain paper, then tap Print.")
+    }
+
+    // ---------------------------------------------------------------- queue
+
+    private fun addToQueue() {
+        if (uris.isEmpty()) { toast("Choose one or more files first"); return }
+        if (ip.isEmpty()) { toast("Select your printer first"); return }
+        if (modeSp.selectedItemPosition == 3) {
+            toast("Guided double-sided needs you between the two sides, so print it with the Print button instead.")
+            return
+        }
+        val base = readOpts().copy(pages = modeSp.selectedItemPosition)
+        val copies = readCopies()
+        val quality = intArrayOf(3, 4, 5)[qualSp.selectedItemPosition]
+        val files = ArrayList(uris)
+        statusTv.text = "Checking ${files.size} file${if (files.size == 1) "" else "s"}…"
+        bg {
+            val checked = files.map { u ->
+                val det = if (PdfTools.isPdf(this, u)) (try { PdfTools.detect(this, u)?.paper } catch (e: Exception) { null }) else null
+                Triple(u, nameOf(u), det)
+            }
+            ui.post { askPapers(checked, 0, base, copies, quality, 0) }
+        }
+    }
+
+    /** Adds files one by one; asks about each PDF whose page size differs from the chosen paper. */
+    private fun askPapers(list: List<Triple<Uri, String, Paper?>>, i: Int, base: Opts, copies: Int, quality: Int, added: Int) {
+        if (i >= list.size) {
+            statusTv.text = "Added $added job${if (added == 1) "" else "s"} to the queue"
+            if (added > 0 && !PrintQueue.running && PrintQueue.waitingFor == null) PrintQueue.start(this, ip)
+            return
+        }
+        val (u, name, det) = list[i]
+        val add = { paper: Paper ->
+            PrintQueue.add(name, listOf(u), base.copy(paper = paper), copies, quality, det)
+            askPapers(list, i + 1, base, copies, quality, added + 1)
+        }
+        if (det != null && det != base.paper) {
+            AlertDialog.Builder(this)
+                .setTitle("Paper size check")
+                .setMessage("\"$name\" is ${det.label} size, but ${base.paper.label} is selected.\n\nPrint it on ${det.label} or ${base.paper.label}?")
+                .setCancelable(false)
+                .setPositiveButton(det.label) { _, _ -> add(det) }
+                .setNegativeButton(base.paper.label) { _, _ -> add(base.paper) }
+                .setNeutralButton("Don't add") { _, _ -> askPapers(list, i + 1, base, copies, quality, added) }
+                .show()
+        } else {
+            add(base.paper)
+        }
+    }
+
+    private fun toggleQueue() {
+        if (PrintQueue.running) { PrintQueue.stop(); return }
+        PrintQueue.waitingFor?.let { showDecision(it); return }
+        if (ip.isEmpty()) { toast("Select your printer first"); return }
+        if (PrintQueue.items.none { it.state == QState.WAITING }) { toast("No jobs waiting"); return }
+        PrintQueue.start(this, ip)
+    }
+
+    override fun onQueueChanged() = renderQueue()
+
+    override fun onDecisionNeeded(item: QItem) = showDecision(item)
+
+    private fun renderQueue() {
+        if (!::queueList.isInitialized) return
+        val items = PrintQueue.items
+        queueSummary.text = PrintQueue.summary()
+        val finished = items.count { it.state != QState.WAITING && it.state != QState.WORKING }
+        queueBar.max = maxOf(1, items.size)
+        queueBar.progress = finished
+        queueBar.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
+        queueStartBtn.text = when {
+            PrintQueue.running && PrintQueue.stopAfterCurrent -> "Stopping…"
+            PrintQueue.running -> "Stop after this job"
+            PrintQueue.waitingFor != null -> "Answer the question"
+            else -> "Start"
+        }
+        queueList.removeAllViews()
+        items.forEachIndexed { idx, it -> queueList.addView(queueRow(idx + 1, it)) }
+    }
+
+    private fun queueRow(n: Int, it: QItem): View {
+        val r = LinearLayout(this)
+        r.orientation = LinearLayout.HORIZONTAL
+        r.gravity = Gravity.CENTER_VERTICAL
+        r.setPadding(0, dp(8), 0, dp(8))
+
+        val badge = label(it.state.badge, 12f, Color.WHITE)
+        val bd = GradientDrawable()
+        bd.setColor(it.state.color)
+        bd.cornerRadius = dp(10).toFloat()
+        badge.background = bd
+        badge.setPadding(dp(8), dp(3), dp(8), dp(3))
+        badge.gravity = Gravity.CENTER
+        r.addView(badge, LinearLayout.LayoutParams(dp(92), ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(10), 0, dp(4), 0)
+        val title = label("$n. ${it.name}", 14f)
+        title.maxLines = 2
+        col.addView(title)
+        val detail = buildString {
+            append(it.opts.paper.label)
+            if (it.opts.gray) append(" · B/W")
+            if (it.copies > 1) append(" · ${it.copies} copies")
+            if (it.opts.pages == 1) append(" · odd pages") else if (it.opts.pages == 2) append(" · even pages")
+            if (it.msg.isNotEmpty()) append("\n").append(it.msg)
+        }
+        col.addView(label(detail, 12f, if (it.state == QState.FAILED) Color.parseColor("#D93025") else grey))
+        r.addView(col, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        when (it.state) {
+            QState.WAITING -> r.addView(button("Remove") { PrintQueue.remove(it) })
+            QState.FAILED, QState.UNCLEAR -> r.addView(button(if (it === PrintQueue.waitingFor) "Answer" else "Retry…") {
+                if (it === PrintQueue.waitingFor) showDecision(it) else confirmRequeue(it)
+            })
+            else -> Unit
+        }
+        return r
+    }
+
+    private fun confirmRequeue(it: QItem) {
+        AlertDialog.Builder(this)
+            .setTitle("Print \"${it.name}\" again?")
+            .setMessage("It goes back in the queue with the same settings. Check the output tray first: " +
+                "some pages may have printed last time.")
+            .setPositiveButton("Print again") { _, _ ->
+                PrintQueue.requeue(it)
+                if (!PrintQueue.running && PrintQueue.waitingFor == null && ip.isNotEmpty()) PrintQueue.start(this, ip)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Asks what to do with a failed or unclear queue job. The queue waits until you answer. */
+    private fun showDecision(item: QItem) {
+        if (isFinishing || isDestroyed || decisionDlg?.isShowing == true) return
+        val pos = PrintQueue.items.indexOf(item) + 1
+        val total = PrintQueue.items.size
+        val b = AlertDialog.Builder(this).setCancelable(false)
+        if (item.state == QState.UNCLEAR) {
+            b.setTitle("Did job $pos of $total print?")
+                .setMessage("${item.name}\n\n${item.msg}\n\nCheck the output tray. Did all its pages come out?")
+                .setPositiveButton("Yes, it printed") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.PRINTED) }
+                .setNeutralButton("No, print it again") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.RETRY) }
+                .setNegativeButton("No, skip it") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.SKIP) }
+        } else {
+            b.setTitle("Job $pos of $total failed")
+                .setMessage("${item.name}\n\n${item.msg}\n\nFix the problem on the printer, then choose what to do.")
+                .setPositiveButton("Retry this job") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.RETRY) }
+                .setNeutralButton("Stop the queue") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.STOP) }
+                .setNegativeButton("Skip it, go on") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.SKIP) }
+        }
+        decisionDlg = b.show()
     }
 
     // ---------------------------------------------------------------- scanning

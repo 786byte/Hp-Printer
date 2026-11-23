@@ -34,11 +34,12 @@ object Escl {
 <pwg:XOffset>0</pwg:XOffset><pwg:YOffset>0</pwg:YOffset>
 <pwg:Width>2480</pwg:Width><pwg:Height>3507</pwg:Height>
 </pwg:ScanRegion></pwg:ScanRegions>
-<scan:InputSource>Platen</scan:InputSource>
+<pwg:InputSource>Platen</pwg:InputSource>
 <scan:ColorMode>$mode</scan:ColorMode>
 <scan:XResolution>$dpi</scan:XResolution>
 <scan:YResolution>$dpi</scan:YResolution>
 <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
+<scan:DocumentFormatExt>image/jpeg</scan:DocumentFormatExt>
 </scan:ScanSettings>"""
 
         val c = Http.open("$base/ScanJobs", net)

@@ -58,7 +58,9 @@ class Prepared(
  * pages: 0 = all sheets, 1 = odd sheets only, 2 = even sheets only.
  * evenRev: print the even sheets in reverse order (usual for manual double-sided).
  * evenPad: when sheet count is odd and evenRev is on, start with a blank sheet so the stack lines up.
- * shortEdge: rotate even sheets 180 degrees (flip like a notepad instead of like a book).
+ * shortEdge: the user flips the paper like a notepad instead of like a book.
+ * turnBacks: this printer's paper path needs the backs upside down (found with the double-sided test page).
+ * Even sheets are rotated 180° when exactly one of the two is set.
  */
 data class Opts(
     val paper: Paper,
@@ -75,7 +77,8 @@ data class Opts(
     val pages: Int = 0,
     val evenRev: Boolean = true,
     val shortEdge: Boolean = false,
-    val evenPad: Boolean = false
+    val evenPad: Boolean = false,
+    val turnBacks: Boolean = false
 )
 
 class BuildResult(val printed: Int, val total: Int)
@@ -255,12 +258,12 @@ object PdfTools {
             var singlePdf: File? = null
             for ((idx, u) in uris.withIndex()) {
                 if (isPdf(ctx, u)) {
-                    val f = File(ctx.cacheDir, "src$idx.pdf")
+                    val f = File(ctx.cacheDir, "src_${System.nanoTime()}_$idx.pdf")
                     val ins = ctx.contentResolver.openInputStream(u) ?: throw Exception("Cannot open file")
                     ins.use { i -> f.outputStream().use { o2 -> i.copyTo(o2) } }
                     val pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
                     val r = PdfRenderer(pfd)
-                    closers.add { r.close(); pfd.close() }
+                    closers.add { r.close(); pfd.close(); f.delete() }
                     if (uris.size == 1 && o.range.isBlank()) singlePdf = f
                     for (pg in parseRange(o.range, r.pageCount)) srcs.add(PdfSrc(r, pg - 1))
                 } else {
@@ -314,7 +317,7 @@ object PdfTools {
             val draw: (Canvas, Int) -> Unit = { c, s ->
                 c.drawColor(Color.WHITE)
                 c.save()
-                if (o.pages == 2 && o.shortEdge) c.rotate(180f, w / 2f, h / 2f)
+                if (o.pages == 2 && (o.shortEdge != o.turnBacks)) c.rotate(180f, w / 2f, h / 2f)
                 if (s >= 0) {
                     for (j in 0 until per) {
                         val k = s * per + j
