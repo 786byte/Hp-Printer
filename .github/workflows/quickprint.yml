@@ -25,6 +25,16 @@ jobs:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
+      - name: Restore signing key
+        env:
+          KEY_B64: ${{ secrets.QUICKPRINT_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEY_B64" ]; then
+            echo "$KEY_B64" | base64 -d > app/quickprint.keystore
+            echo "Using the fixed Quick Print signing key."
+          else
+            echo "::warning::QUICKPRINT_KEYSTORE_B64 secret not set: this APK is signed with a temporary key and won't install over another build."
+          fi
       - name: Build APK
         run: |
           set -o pipefail

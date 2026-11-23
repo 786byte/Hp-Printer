@@ -91,7 +91,7 @@ object DirectPrint {
             }
             progress("Sending to printer…")
             id = try {
-                Ipp.printJob(ip, net, file!!, format, jobName.ifBlank { "Quick Print " + stamp() },
+                Ipp.printJob(ip, net, file, format, jobName.ifBlank { "Quick Print " + stamp() },
                     sendCopies, o.paper.media, !o.gray, quality, raster)
             } catch (e: IppException) {
                 // The printer answered and said no: nothing will print.

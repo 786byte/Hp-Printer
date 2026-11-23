@@ -18,20 +18,26 @@ android {
     }
 
     // Fixed signing key so every new build installs over the old one (keeps your data).
+    // The key is not stored in the repository: CI writes it from the QUICKPRINT_KEYSTORE_B64 secret.
+    // Without it the build falls back to a throwaway debug key (installs fine, but can't update an older install).
+    val qpKey = file("quickprint.keystore")
     signingConfigs {
-        create("qp") {
-            storeFile = file("quickprint.keystore")
-            storePassword = "quickprint"
-            keyAlias = "quickprint"
-            keyPassword = "quickprint"
+        if (qpKey.exists()) {
+            create("qp") {
+                storeFile = qpKey
+                storePassword = System.getenv("QUICKPRINT_KEY_PASSWORD") ?: "quickprint"
+                keyAlias = "quickprint"
+                keyPassword = System.getenv("QUICKPRINT_KEY_PASSWORD") ?: "quickprint"
+            }
         }
     }
     buildTypes {
+        val signing = if (qpKey.exists()) signingConfigs.getByName("qp") else signingConfigs.getByName("debug")
         getByName("debug") {
-            signingConfig = signingConfigs.getByName("qp")
+            signingConfig = signing
         }
         getByName("release") {
-            signingConfig = signingConfigs.getByName("qp")
+            signingConfig = signing
             isMinifyEnabled = false
         }
     }
