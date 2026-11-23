@@ -31,7 +31,8 @@ jobs:
           ./gradlew assembleRelease 2>&1 | tee build.log
       - name: Show build errors
         if: failure()
-        run: grep -E "^e: |What went wrong|^ERROR|error:|Exception:" -A3 build.log | head -150
+        run: |
+          grep -E "^e: |What went wrong|^ERROR|error:|Exception:" -A3 build.log | head -150
       - name: Check the APK is installable
         run: |
           BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
