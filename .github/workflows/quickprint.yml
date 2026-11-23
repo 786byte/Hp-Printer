@@ -1,0 +1,53 @@
+name: Quick Print APK
+
+on:
+  push:
+    paths: ["QuickPrint/**", ".github/workflows/quickprint.yml"]
+  pull_request:
+    paths: ["QuickPrint/**", ".github/workflows/quickprint.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: QuickPrint
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build APK
+        run: ./gradlew assembleRelease --stacktrace
+      - name: Check the APK is installable
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          APK=app/build/outputs/apk/release/app-release.apk
+          $BT/apksigner verify --print-certs $APK
+          $BT/aapt2 dump badging $APK | grep -E "^(package|sdkVersion|targetSdkVersion|application-label|launchable-activity)"
+          cp $APK ../QuickPrint.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QuickPrint-apk
+          path: QuickPrint.apk
+          if-no-files-found: error
+      - name: Publish release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: quickprint-v3.0.${{ github.run_number }}
+          name: Quick Print 3.0.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: QuickPrint.apk
+          body: |
+            **Install on your phone:** tap `QuickPrint.apk` below, open it, and allow installing from your browser if Android asks.
+            New versions install over the old one and keep your settings and page counters.

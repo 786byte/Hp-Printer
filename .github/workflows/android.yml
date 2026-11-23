@@ -2,7 +2,9 @@ name: Build APK
 
 on:
   push:
+    paths-ignore: ["QuickPrint/**", ".github/workflows/quickprint.yml"]
   pull_request:
+    paths-ignore: ["QuickPrint/**", ".github/workflows/quickprint.yml"]
   workflow_dispatch:
 
 permissions:
@@ -42,7 +44,7 @@ jobs:
           tag_name: v1.0.${{ github.run_number }}
           name: Just Print It 1.0.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
-          make_latest: true
+          make_latest: false
           files: JustPrintIt.apk
           body: |
             **Install on your phone:** tap `JustPrintIt.apk` below, open it, and allow installing from your browser if Android asks.
