@@ -43,7 +43,15 @@ backup file first).
   ("PDF is Legal, print on Legal or A4?") — for single prints and for each queued file
 - Counters: colour vs B/W, today / this month / all time, plus the printer's own lifetime counter (HP LEDM)
 - Never retries a failed job by itself; asks "Did it print?" whenever the result is unclear
-- Wi-Fi and mobile data at the same time: printer traffic is pinned to Wi-Fi
+- **Resume where it stopped**: while printing, the app saves how many sheets the printer has finished. If a job
+  fails, choose *Resume from sheet N* (or type how many came out) and only the rest prints — for single prints,
+  each side of guided double-sided, and queue jobs. An *Unfinished print* card survives crashes and restarts.
+- **Any network**: works on the home Wi-Fi or on the printer's own Wi-Fi Direct, and finds the printer again
+  automatically when its address changes (remembered addresses, 192.168.223.1, Wi-Fi search). Mobile data can stay
+  on. *Printer's own Wi-Fi (Wi-Fi Direct)…* joins the printer's network from inside the app; on phones that support
+  two Wi-Fi connections the home Wi-Fi stays connected too.
+- Stability: no reused HTTP connections (HP printers drop idle ones), errors shown instead of crashing, and if the
+  app ever crashes the details are kept so you can copy and send them
 - Scan from the glass to PDF or JPG, several pages
 - Share a file to Quick Print from any app
 - Backup: Android auto-backup to your Google account, plus save/restore a backup file (e.g. to Google Drive)
