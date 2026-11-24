@@ -97,8 +97,11 @@ class MainActivity : Activity(), PrintQueue.Listener {
     private lateinit var queueList: LinearLayout
     private lateinit var queueStartBtn: Button
     private var decisionDlg: AlertDialog? = null
-    /** True while a guided double-sided job runs: it must print one copy so fronts and backs stay in step. */
-    private var guidedActive = false
+    /** True while a print is being sent/followed (hides the "Unfinished print" card). */
+    private var jobRunning = false
+    private lateinit var resumeCard: LinearLayout
+    private lateinit var resumeTv: TextView
+    private lateinit var resumeBtn: Button
 
     private val papers = Paper.values()
     private val nups = intArrayOf(1, 2, 3, 4, 6, 9)
@@ -109,12 +112,29 @@ class MainActivity : Activity(), PrintQueue.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("qp", Context.MODE_PRIVATE)
+        CrashSaver.install(applicationContext)
         ip = prefs.getString("ip", "") ?: ""
         printerName = prefs.getString("name", "") ?: ""
         disc = Discovery(this) { name, addr -> foundListener?.invoke(name, addr) }
         buildUi()
         updStats()
         handleIntent(intent)
+        CrashSaver.lastCrash(this)?.let { showCrash(it) }
+    }
+
+    private fun showCrash(text: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Quick Print closed unexpectedly last time")
+            .setMessage("Sorry about that. If it keeps happening, copy the details and send them so it can be fixed.\n\n" +
+                text.take(600))
+            .setPositiveButton("Copy details") { _, _ ->
+                val cm = getSystemService(android.content.ClipboardManager::class.java)
+                cm?.setPrimaryClip(android.content.ClipData.newPlainText("Quick Print crash", text))
+                CrashSaver.clear(this)
+                toast("Copied")
+            }
+            .setNegativeButton("OK") { _, _ -> CrashSaver.clear(this) }
+            .safeShow()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -127,6 +147,7 @@ class MainActivity : Activity(), PrintQueue.Listener {
         PrintQueue.listener = this
         renderQueue()
         PrintQueue.waitingFor?.let { showDecision(it) }
+        updResumeCard()
         refreshInk()
     }
 
@@ -140,7 +161,21 @@ class MainActivity : Activity(), PrintQueue.Listener {
     // ---------------------------------------------------------------- helpers
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-    private fun bg(block: () -> Unit) = Thread { block() }.start()
+    /** Runs [block] off the main thread. Any error is shown instead of crashing the app. */
+    private fun bg(block: () -> Unit) = Thread {
+        try {
+            block()
+        } catch (t: Throwable) {
+            ui.post {
+                if (::printBtn.isInitialized && !jobRunning) printBtn.isEnabled = true
+                if (::statusTv.isInitialized) statusTv.text = "Something went wrong: " + (t.message ?: t.javaClass.simpleName)
+            }
+        }
+    }.start()
+
+    /** Shows a dialog only while this screen exists (a late dialog on a closed screen crashes Android apps). */
+    private fun AlertDialog.Builder.safeShow(): AlertDialog? =
+        if (isFinishing || isDestroyed) null else try { show() } catch (e: Exception) { null }
     private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_LONG).show()
     private fun stamp() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
     private val grey = Color.parseColor("#667085")
@@ -236,6 +271,24 @@ class MainActivity : Activity(), PrintQueue.Listener {
         statusTv.setPadding(dp(2), 0, 0, dp(10))
         root.addView(statusTv)
 
+        // Unfinished print (shown only when there is one)
+        resumeCard = card("Unfinished print")
+        resumeTv = label("", 14f)
+        resumeCard.addView(resumeTv)
+        resumeBtn = button("Resume", true) { resumeSaved(false) }
+        resumeCard.addView(resumeBtn)
+        resumeCard.addView(row(
+            button("Start over") { resumeSaved(true) },
+            button("Discard") {
+                AlertDialog.Builder(this)
+                    .setTitle("Discard the unfinished print?")
+                    .setPositiveButton("Discard") { _, _ -> Resume.clear(this); updResumeCard() }
+                    .setNegativeButton("Keep", null)
+                    .safeShow()
+            }
+        ))
+        resumeCard.visibility = View.GONE
+
         // Printer + ink
         val pc = card("Printer & ink")
         printerTv = label("No printer selected", 15f)
@@ -245,6 +298,7 @@ class MainActivity : Activity(), PrintQueue.Listener {
             button("Enter IP") { enterIp() },
             button("Refresh") { refreshInk() }
         ))
+        pc.addView(button("Printer's own Wi-Fi (Wi-Fi Direct)…") { printerWifi() })
         inkNote = label("", 13f, grey)
         pc.addView(inkNote)
         inkBox = LinearLayout(this)
@@ -349,7 +403,7 @@ class MainActivity : Activity(), PrintQueue.Listener {
                 .setMessage("This clears the page counts shown above.")
                 .setPositiveButton("Reset") { _, _ -> Stats.reset(this); updStats() }
                 .setNegativeButton("Cancel", null)
-                .show()
+                .safeShow()
         })
 
         // Backup
@@ -442,7 +496,7 @@ class MainActivity : Activity(), PrintQueue.Listener {
                 if (v.isNotEmpty()) setPrinter(v, "Printer")
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .safeShow()
     }
 
     private fun setPrinter(addr: String, name: String) {
@@ -460,22 +514,75 @@ class MainActivity : Activity(), PrintQueue.Listener {
             return
         }
         printerTv.text = (if (printerName.isEmpty()) "Printer" else printerName) + "  ·  " + ip
+        if (!refreshing.compareAndSet(false, true)) return
         inkNote.text = "Checking…"
-        val target = ip
-        bg {
-            try {
-                val net = Net.wifi(this)
-                val st = Ipp.status(target, net)
-                ui.post { if (target == ip) showStatus(st) }
-                val u = try { Ledm.usage(target, net) } catch (e: Exception) { null }
-                ui.post { showUsage(u) }
-            } catch (e: Exception) {
-                ui.post {
-                    inkBox.removeAllViews()
-                    inkNote.text = "Can't reach the printer at $target. Is the phone connected to the printer's Wi-Fi?"
+        bg { try { refreshNow() } finally { refreshing.set(false) } }
+    }
+
+    private val refreshing = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun refreshNow() {
+        val target = locate { m -> ui.post { inkNote.text = m } }
+        if (target == null) {
+            ui.post {
+                inkBox.removeAllViews()
+                inkNote.text = "Can't find the printer. Connect the phone to the home Wi-Fi, or to the printer's own " +
+                    "Wi-Fi (DIRECT-…) with the button above. Mobile data can stay on."
+            }
+            return
+        }
+        val net = Net.forIp(this, target)
+        val st = try { Ipp.status(target, net) } catch (e: Exception) { null }
+        if (st == null) {
+            ui.post { inkNote.text = "The printer at $target didn't answer. Is it busy or waking up? Tap Refresh." }
+            return
+        }
+        Locator.remember(this, target, st.model)
+        val via = Net.describe(this, target)
+        ui.post { if (target == ip) { showStatus(st); inkNote.append("  ·  via $via") } }
+        val u = try { Ledm.usage(target, net) } catch (e: Exception) { null }
+        ui.post { showUsage(u) }
+    }
+
+    /** Join the printer's Wi-Fi Direct from the app, keeping mobile data (and on some phones home Wi-Fi) on. */
+    private fun printerWifi() {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(20), dp(8), dp(20), 0)
+        val ssid = EditText(this)
+        ssid.hint = "Network name, e.g. DIRECT-39-HP Smart Tank 580"
+        ssid.setText(prefs.getString("direct_ssid", "") ?: "")
+        val pass = EditText(this)
+        pass.hint = "Password (printer's Wi-Fi Direct page / report)"
+        pass.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+        pass.setText(prefs.getString("direct_pass", "") ?: "")
+        box.addView(ssid)
+        box.addView(pass)
+        val connected = PrinterWifi.network != null
+        AlertDialog.Builder(this)
+            .setTitle("Printer's own Wi-Fi")
+            .setMessage("Quick Print joins the printer's Wi-Fi only for printing. Mobile data stays on for the internet, " +
+                "and phones that support two Wi-Fi connections stay on your home Wi-Fi too.\n\n" +
+                "Find the name and password on the printer (Wi-Fi Direct button / network report)." +
+                if (connected) "\n\nStatus: connected." else "")
+            .setView(box)
+            .setPositiveButton("Connect") { _, _ ->
+                val n = ssid.text.toString().trim()
+                val pw = pass.text.toString()
+                if (n.isEmpty()) { toast("Enter the network name"); return@setPositiveButton }
+                prefs.edit().putString("direct_ssid", n).putString("direct_pass", pw).apply()
+                statusTv.text = "Joining $n… (approve Android's prompt)"
+                PrinterWifi.connect(applicationContext, n, pw) { ok, msg ->
+                    ui.post {
+                        statusTv.text = msg
+                        if (ok) refreshInk()
+                    }
                 }
             }
-        }
+            .setNeutralButton(if (connected) "Disconnect" else "Cancel") { _, _ ->
+                if (connected) { PrinterWifi.disconnect(applicationContext); statusTv.text = "Left the printer's Wi-Fi"; refreshInk() }
+            }
+            .safeShow()
     }
 
     private fun showUsage(u: Usage?) {
@@ -616,7 +723,7 @@ class MainActivity : Activity(), PrintQueue.Listener {
                     toast("Backup restored")
                 }
                 .setNegativeButton("Cancel", null)
-                .show()
+                .safeShow()
         } catch (e: Exception) {
             toast("Couldn't restore: " + (e.message ?: ""))
         }
@@ -733,7 +840,7 @@ class MainActivity : Activity(), PrintQueue.Listener {
                 }
                 .setNegativeButton(sel.label) { _, _ -> startPrint() }
                 .setNeutralButton("Cancel", null)
-                .show()
+                .safeShow()
         } else {
             startPrint()
         }
@@ -742,47 +849,65 @@ class MainActivity : Activity(), PrintQueue.Listener {
     private fun startPrint() {
         prefs.edit().putInt("send", sendSp.selectedItemPosition).apply()
         val list = ArrayList(uris)
+        val names = list.map { nameOf(it) }
+        val mode = modeSp.selectedItemPosition
         val base = readOpts()
-        guidedActive = modeSp.selectedItemPosition == 3
-        when (modeSp.selectedItemPosition) {
-            0 -> runJob(list, base, "") { }
-            1 -> runJob(list, base.copy(pages = 1), "odd pages") { }
-            2 -> runJob(list, base.copy(pages = 2), "even pages") { }
-            else -> runGuided(list, base)
+        // Guided double-sided must keep fronts and backs in step, so it prints one copy.
+        val copies = if (mode == 3) 1 else readCopies()
+        val quality = intArrayOf(3, 4, 5)[qualSp.selectedItemPosition]
+        val det = detectedPaper
+        printBtn.isEnabled = false
+        statusTv.text = "Getting the files ready…"
+        bg {
+            // Copy into the app first: a resume after a restart needs the files, and shared-file access expires.
+            val staged = Resume.stage(this, list, names)
+            ui.post { launch(PrintJobSpec(staged, names, base, copies, quality, det, mode, 1), 0) }
         }
     }
 
-    /** Double-sided in two steps: front sides first, then the backs. */
-    private fun runGuided(list: List<Uri>, base: Opts) {
-        runJob(list, base.copy(pages = 1), "side 1 of 2") { total ->
-            if (total < 2) {
-                statusTv.text = "Done. The document has only one sheet, so there is no back side."
-                return@runJob
-            }
-            AlertDialog.Builder(this)
-                .setTitle("Side 1 printed")
-                .setMessage(
-                    "1. Take the printed pages out of the output tray. Keep them in the same order.\n" +
-                        "2. Put the stack back in the paper tray so the BLANK sides get printed. Don't turn it around.\n" +
-                        "3. Slide the paper guides against the stack.\n\n" +
-                        "First time? Use \"Print a double-sided test\". If the backs come out upside down, tick " +
-                        "\"Turn back sides upside down\"; if they land on the wrong sheets, change \"Even-page order\"."
-                )
-                .setCancelable(false)
-                .setPositiveButton("Print other side") { _, _ ->
-                    runJob(list, base.copy(pages = 2, evenPad = true), "side 2 of 2") {
-                        statusTv.text = "Double-sided print finished ✓"
-                        guidedActive = false
-                    }
-                }
-                .setNegativeButton("Stop here") { _, _ -> statusTv.text = "Stopped after side 1"; guidedActive = false }
-                .show()
-        }
+    /** Runs one pass of [spec], leaving out the first [skip] sheets because they already printed. */
+    private fun launch(spec: PrintJobSpec, skip: Int) {
+        Resume.begin(this, spec, skip)
+        jobRunning = true
+        updResumeCard()
+        val o = spec.opts(skip)
+        val tag = tagOf(spec.what) + if (skip > 0) " — from sheet ${skip + 1}" else ""
+        if (sendSp.selectedItemPosition == 0 && ip.isNotEmpty()) runDirect(spec, o, skip, tag)
+        else runAndroid(spec, o, skip, tag)
     }
 
-    private fun runJob(list: List<Uri>, o: Opts, what: String, onDone: (Int) -> Unit) {
-        if (sendSp.selectedItemPosition == 0 && ip.isNotEmpty()) runDirect(list, o, what, onDone)
-        else runAndroid(list, o, what, onDone)
+    private fun jobEnded() {
+        jobRunning = false
+        printBtn.isEnabled = true
+        updResumeCard()
+    }
+
+    /** A pass printed completely: finish, or move on to the backs of a guided double-sided job. */
+    private fun passDone(spec: PrintJobSpec, total: Int) {
+        Resume.clear(this)
+        jobEnded()
+        refreshInk()
+        if (spec.mode != 3) { statusTv.text = "Printed ✓${tagOf(spec.what)}"; return }
+        if (spec.side == 2) { statusTv.text = "Double-sided print finished ✓"; return }
+        if (total < 2) { statusTv.text = "Done. The document has only one sheet, so there is no back side."; return }
+        // Remember that the backs are still to do, so closing the app doesn't lose the second step.
+        val backs = spec.copy(side = 2)
+        Resume.begin(this, backs, 0)
+        updResumeCard()
+        statusTv.text = "Side 1 printed — waiting for you to reload the paper"
+        AlertDialog.Builder(this)
+            .setTitle("Side 1 printed")
+            .setMessage(
+                "1. Take the printed pages out of the output tray. Keep them in the same order.\n" +
+                    "2. Put the stack back in the paper tray so the BLANK sides get printed. Don't turn it around.\n" +
+                    "3. Slide the paper guides against the stack.\n\n" +
+                    "First time? Use \"Print a double-sided test\". If the backs come out upside down, tick " +
+                    "\"Turn back sides upside down\"; if they land on the wrong sheets, change \"Even-page order\"."
+            )
+            .setCancelable(false)
+            .setPositiveButton("Print other side") { _, _ -> launch(backs, 0) }
+            .setNegativeButton("Later") { _, _ -> statusTv.text = "Side 2 saved — print it any time from \"Unfinished print\"" }
+            .safeShow()
     }
 
     private fun tagOf(what: String) = if (what.isEmpty()) "" else " ($what)"
@@ -791,98 +916,180 @@ class MainActivity : Activity(), PrintQueue.Listener {
 
     // ---------- direct to printer (IPP over Wi-Fi)
 
-    private fun runDirect(list: List<Uri>, o: Opts, what: String, onDone: (Int) -> Unit) {
-        val tag = tagOf(what)
-        val target = ip
-        // Guided double-sided must keep fronts and backs in step, so it prints one copy.
-        val copies = if (guidedActive) 1 else readCopies()
-        val det = detectedPaper
-        val quality = intArrayOf(3, 4, 5)[qualSp.selectedItemPosition]
-        val retry = { runDirect(list, o, what, onDone) }
+    /** Background thread: where the printer answers right now; switches the saved address if it moved. */
+    private fun locate(progress: (String) -> Unit): String? {
+        val current = ip
+        val found = Locator.find(this, current, printerName, progress) ?: return null
+        if (found != current) ui.post {
+            ip = found
+            prefs.edit().putString("ip", found).apply()
+            printerTv.text = (if (printerName.isEmpty()) "Printer" else printerName) + "  ·  " + found
+            toast("Printer found at $found (${Net.describe(this, found)})")
+        }
+        return found
+    }
+
+    private fun runDirect(spec: PrintJobSpec, o: Opts, skip: Int, tag: String) {
         printBtn.isEnabled = false
-        statusTv.text = "Preparing…$tag"
+        statusTv.text = "Finding the printer…$tag"
         bg {
-            val out = DirectPrint.run(this, target, list, o, copies, quality, det, "Quick Print " + stamp()) { m ->
-                ui.post { statusTv.text = m + tag }
-            }
-            ui.post {
-                printBtn.isEnabled = true
-                when (out) {
-                    is Outcome.Done -> finishJob(out.sheets, out.color, tag) { onDone(out.total) }
-                    is Outcome.Unclear -> askDidItPrint(tag, out.why, { finishJob(out.sheets, out.color, tag) { onDone(out.total) } }, retry)
-                    is Outcome.Cancelled -> statusTv.text = "Cancelled on the printer$tag"
-                    is Outcome.NoDirect -> {
-                        toast("This printer doesn't take direct jobs. Using the Android print screen.")
-                        runAndroid(list, o, what, onDone)
-                    }
-                    is Outcome.Failed -> if (out.nothingSent) {
-                        statusTv.text = "Couldn't send$tag"
-                        AlertDialog.Builder(this)
-                            .setTitle("Couldn't print")
-                            .setMessage(out.why + "\n\nNothing was printed or counted.")
-                            .setCancelable(false)
-                            .setPositiveButton("Try again") { _, _ -> retry() }
-                            .setNeutralButton("Use print screen") { _, _ -> runAndroid(list, o, what, onDone) }
-                            .setNegativeButton("Cancel") { _, _ -> statusTv.text = "Print cancelled" }
-                            .show()
-                    } else askFailed(tag, out.why, retry)
+            val target = locate { m -> ui.post { statusTv.text = m } }
+            if (target == null) {
+                ui.post {
+                    jobEnded()
+                    askResume(spec, "Can't find the printer on this Wi-Fi. Connect the phone to the home Wi-Fi or the " +
+                        "printer's own Wi-Fi (DIRECT-…), then try again.", skip, 0, true, skip)
                 }
+                return@bg
+            }
+            val out = DirectPrint.run(this, target, spec.files, o, spec.copies, spec.quality, spec.detected,
+                "Quick Print — ${spec.title}", { m -> ui.post { statusTv.text = m + tag } }, { n -> Resume.progress(this, n) })
+            ui.post { handle(spec, skip, tag, out) }
+        }
+    }
+
+    private fun handle(spec: PrintJobSpec, skip: Int, tag: String, out: Outcome) {
+        when (out) {
+            is Outcome.Done -> {
+                Stats.add(this, out.inked, out.color)
+                updStats()
+                passDone(spec, out.total)
+            }
+            is Outcome.Cancelled -> {
+                jobEnded()
+                Resume.failed(this, "Cancelled on the printer")
+                statusTv.text = "Cancelled on the printer$tag — you can resume it from \"Unfinished print\""
+            }
+            is Outcome.NoDirect -> {
+                toast("This printer doesn't take direct jobs. Using the Android print screen.")
+                runAndroid(spec, spec.opts(skip), skip, tag)
+            }
+            is Outcome.Failed -> {
+                jobEnded()
+                val printed = out.printed
+                if (printed != null && printed > 0) { Stats.add(this, printed, out.color); updStats() }
+                Resume.sent(this, out.sent)
+                Resume.failed(this, out.why)
+                updResumeCard()
+                askResume(spec, out.why, skip + (printed ?: 0), skip + out.sent, printed != null, skip + (printed ?: 0))
+            }
+            is Outcome.Unclear -> {
+                jobEnded()
+                Resume.sent(this, out.sent)
+                Resume.failed(this, out.why)
+                updResumeCard()
+                askUnclear(spec, out.why, skip, out.printed, out.sent, out.inked, out.color, out.total)
             }
         }
     }
 
-    private fun finishJob(sheets: Int, color: Boolean, tag: String, then: () -> Unit) {
-        Stats.add(this, sheets, color)
-        updStats()
-        statusTv.text = "Printed ✓$tag"
-        refreshInk()
-        then()
+    /**
+     * A pass stopped part-way. [done] = sheets of this pass known to be printed, [passTotal] = sheets in the pass
+     * (0 = unknown), [counted] = how many of them the counters already include.
+     */
+    private fun askResume(spec: PrintJobSpec, why: String, done: Int, passTotal: Int, known: Boolean, counted: Int) {
+        val tag = tagOf(spec.what)
+        val of = if (passTotal > 0) " of $passTotal" else ""
+        statusTv.text = "Stopped$tag — $done$of sheets printed"
+        val msg = why + "\n\n" + when {
+            known && done > 0 -> "Sheets 1–$done$of are printed. Resuming prints only the rest."
+            known -> "Nothing of this job has printed yet."
+            else -> "The printer didn't say how many sheets came out. Count the fully printed sheets in the output tray."
+        } + "\n\nThe app never retries by itself."
+        val b = AlertDialog.Builder(this).setTitle("Printing stopped").setMessage(msg).setCancelable(false)
+        when {
+            !known -> b.setPositiveButton("Count & resume…") { _, _ -> askCount(spec, done, passTotal, counted) }
+            done > 0 && (passTotal == 0 || done < passTotal) ->
+                b.setPositiveButton("Resume from sheet ${done + 1}") { _, _ -> launch(spec, done) }
+            else -> b.setPositiveButton("Try again") { _, _ -> launch(spec, done) }
+        }
+        if (known) b.setNeutralButton("Other…") { _, _ -> askCount(spec, done, passTotal, counted) }
+        b.setNegativeButton("Later") { _, _ -> statusTv.text = "Saved — resume any time from \"Unfinished print\"" }
+        b.safeShow()
     }
 
-    private fun askDidItPrint(tag: String, why: String, finish: () -> Unit, retry: () -> Unit) {
+    private fun askUnclear(spec: PrintJobSpec, why: String, skip: Int, printed: Int?, sent: Int, inked: Int, color: Boolean, total: Int) {
+        val tag = tagOf(spec.what)
         statusTv.text = "Not sure if it printed$tag"
+        val last = if (printed != null) "\n\nThe printer last confirmed ${skip + printed} of ${skip + sent} sheets." else ""
         AlertDialog.Builder(this)
             .setTitle("Did it print?")
-            .setMessage("$why\n\nThe app can't tell whether this job$tag finished. Did all the pages come out correctly?")
+            .setMessage("$why$last\n\nCheck the output tray. Did every sheet of this job$tag come out?")
             .setCancelable(false)
-            .setPositiveButton("Yes") { _, _ -> finish() }
-            .setNeutralButton("No, print again") { _, _ -> retry() }
-            .setNegativeButton("No, stop") { _, _ -> statusTv.text = "Stopped$tag" }
-            .show()
+            .setPositiveButton("Yes, all of it") { _, _ ->
+                Stats.add(this, inked, color)
+                updStats()
+                passDone(spec, total)
+            }
+            .setNeutralButton("No / only some…") { _, _ -> askCount(spec, skip + (printed ?: 0), skip + sent, skip) }
+            .setNegativeButton("Later") { _, _ -> statusTv.text = "Saved — resume any time from \"Unfinished print\"" }
+            .safeShow()
     }
 
-    private fun askFailed(tag: String, why: String, retry: () -> Unit) {
-        statusTv.text = "Print failed$tag"
+    /** Lets you say how many sheets came out, then resumes after them (or starts over). */
+    private fun askCount(spec: PrintJobSpec, suggested: Int, passTotal: Int, counted: Int) {
+        val et = EditText(this)
+        et.inputType = InputType.TYPE_CLASS_NUMBER
+        et.setText(suggested.toString())
+        et.setSelection(et.text.length)
+        val of = if (passTotal > 0) " (of $passTotal)" else ""
         AlertDialog.Builder(this)
-            .setTitle("Print failed")
-            .setMessage("$why\n\nThis job$tag was not counted. Check the output tray before trying again.\n\nTry again?")
+            .setTitle("How many sheets came out?")
+            .setMessage("Count the fully printed sheets of this job$of in the output tray. " +
+                "A half-printed or smudged sheet doesn't count — it will be printed again.")
+            .setView(et)
             .setCancelable(false)
-            .setPositiveButton("Try again") { _, _ -> retry() }
-            .setNegativeButton("Cancel") { _, _ -> statusTv.text = "Print cancelled" }
-            .show()
+            .setPositiveButton("Resume after these") { _, _ ->
+                var n = (et.text.toString().toIntOrNull() ?: 0).coerceAtLeast(0)
+                if (passTotal > 0) n = n.coerceAtMost(passTotal)
+                if (n > counted) { Stats.add(this, n - counted, !spec.base.gray); updStats() }
+                launch(spec, n)
+            }
+            .setNeutralButton("Start over") { _, _ -> launch(spec, 0) }
+            .setNegativeButton("Cancel") { _, _ -> statusTv.text = "Saved — resume any time from \"Unfinished print\"" }
+            .safeShow()
+    }
+
+    // ---------- unfinished print (survives failures, crashes and restarts)
+
+    private fun updResumeCard() {
+        if (!::resumeCard.isInitialized) return
+        val saved = if (jobRunning) null else Resume.load(this)
+        if (saved == null) { resumeCard.visibility = View.GONE; return }
+        resumeCard.visibility = View.VISIBLE
+        val of = if (saved.passTotal > 0) " of ${saved.passTotal}" else ""
+        resumeTv.text = buildString {
+            append(saved.spec.title)
+            if (saved.spec.what.isNotEmpty()) append("  ·  ").append(saved.spec.what)
+            append("\n").append("${saved.done}$of sheets printed")
+            if (saved.why.isNotEmpty()) append("\nLast problem: ").append(saved.why)
+        }
+        resumeBtn.text = if (saved.done > 0) "Resume from sheet ${saved.done + 1}" else "Print it"
+    }
+
+    private fun resumeSaved(fromStart: Boolean) {
+        val saved = Resume.load(this) ?: return updResumeCard()
+        launch(saved.spec, if (fromStart) 0 else saved.done)
     }
 
     // ---------- Android print screen
 
-    private fun runAndroid(list: List<Uri>, o: Opts, what: String, onDone: (Int) -> Unit) {
+    private fun runAndroid(spec: PrintJobSpec, o: Opts, skip: Int, tag: String) {
         printBtn.isEnabled = false
-        statusTv.text = "Preparing…"
+        statusTv.text = "Preparing…$tag"
         bg {
             var prep: Prepared? = null
             try {
-                val p = PdfTools.prepare(this, list, o)
+                val p = PdfTools.prepare(this, spec.files, o)
                 prep = p
-                cacheDir.listFiles()?.forEach { if (it.name.startsWith("job_")) it.delete() }
-                val out = File(cacheDir, "job_" + System.currentTimeMillis() + ".pdf")
-                PdfTools.writePdf(p, out) { i, n -> ui.post { statusTv.text = "Preparing $i / $n…" } }
-                val res = BuildResult(p.order.count { it >= 0 }, p.total)
-                ui.post {
-                    printBtn.isEnabled = true
-                    submit(out, res, o, what, onDone)
-                }
+                val out = File(cacheDir, "job_" + System.nanoTime() + ".pdf")
+                PdfTools.writePdf(p, out, skip) { i, n -> ui.post { statusTv.text = "Preparing $i / $n…$tag" } }
+                val seq = p.sequence(1, skip)
+                val res = BuildResult(seq.count { it >= 0 }, p.total)
+                ui.post { submit(out, res, o, spec, skip, tag, seq.size) }
             } catch (e: Throwable) {
                 ui.post {
-                    printBtn.isEnabled = true
+                    jobEnded()
                     statusTv.text = "Couldn't prepare: " + (e.message ?: e.javaClass.simpleName)
                 }
             } finally {
@@ -903,53 +1110,65 @@ class MainActivity : Activity(), PrintQueue.Listener {
         return if (o.landscape) m.asLandscape() else m.asPortrait()
     }
 
-    private fun submit(file: File, res: BuildResult, o: Opts, what: String, onDone: (Int) -> Unit) {
+    private fun submit(file: File, res: BuildResult, o: Opts, spec: PrintJobSpec, skip: Int, tag: String, sheets: Int) {
         val pm = getSystemService(Context.PRINT_SERVICE) as PrintManager
         val attrs = PrintAttributes.Builder()
             .setMediaSize(mediaOf(o))
             .setMinMargins(PrintAttributes.Margins.NO_MARGINS)
             .setColorMode(if (o.gray) PrintAttributes.COLOR_MODE_MONOCHROME else PrintAttributes.COLOR_MODE_COLOR)
             .build()
-        val job = pm.print("Quick Print " + stamp(), FileAdapter(file, "QuickPrint.pdf", res.printed), attrs)
+        val job: PrintJob? = try {
+            pm.print("Quick Print " + stamp(), FileAdapter(file, "QuickPrint.pdf", sheets), attrs)
+        } catch (e: Exception) {
+            null
+        }
         if (job == null) {
+            jobEnded()
             statusTv.text = "Couldn't open the print screen."
             return
         }
-        watch(job, res, what, { submit(file, res, o, what, onDone) }, onDone)
+        watch(job, res, spec, skip, tag, sheets)
     }
 
     /** Polls the print job. On failure, or if it stops updating, it asks you; it never retries by itself. */
-    private fun watch(job: PrintJob, res: BuildResult, what: String, retry: () -> Unit, onDone: (Int) -> Unit) {
-        val tag = tagOf(what)
+    private fun watch(job: PrintJob, res: BuildResult, spec: PrintJobSpec, skip: Int, tag: String, sheets: Int) {
         var lastState = -1
         var lastChange = System.currentTimeMillis()
         var color = true
         var copies = 1
-        val finish = {
-            Stats.add(this@MainActivity, res.printed * copies, color)
-            updStats()
-            statusTv.text = "Printed ✓$tag"
-            refreshInk()
-            onDone(res.total)
-        }
         val r = object : Runnable {
             override fun run() {
+                if (isDestroyed) return
                 val info = job.info
-                if (info != null) {
-                    copies = maxOf(1, info.copies)
-                    color = info.attributes?.colorMode != PrintAttributes.COLOR_MODE_MONOCHROME
-                }
-                val state = info?.state ?: 0
+                copies = maxOf(1, info.copies)
+                color = info.attributes.colorMode != PrintAttributes.COLOR_MODE_MONOCHROME
+                val state = info.state
                 if (state != lastState) {
                     lastState = state
                     lastChange = System.currentTimeMillis()
                 }
                 when {
-                    job.isCompleted -> finish()
-                    job.isFailed -> askFailed(tag, "the print service reported an error", retry)
-                    job.isCancelled -> statusTv.text = "Print cancelled$tag"
-                    state != PrintJobInfo.STATE_CREATED && System.currentTimeMillis() - lastChange > 90000 ->
-                        askDidItPrint(tag, "The print service hasn't reported progress for 90 seconds.", finish, retry)
+                    job.isCompleted -> {
+                        Stats.add(this@MainActivity, res.printed * copies, color)
+                        updStats()
+                        passDone(spec, res.total)
+                    }
+                    job.isFailed -> {
+                        jobEnded()
+                        Resume.sent(this@MainActivity, sheets)
+                        Resume.failed(this@MainActivity, "The print service reported an error")
+                        askResume(spec, "The print service reported an error.", skip, skip + sheets, false, skip)
+                    }
+                    job.isCancelled -> {
+                        jobEnded()
+                        statusTv.text = "Print cancelled$tag"
+                    }
+                    state != PrintJobInfo.STATE_CREATED && System.currentTimeMillis() - lastChange > 90000 -> {
+                        jobEnded()
+                        Resume.sent(this@MainActivity, sheets)
+                        askUnclear(spec, "The print service hasn't reported progress for 90 seconds.", skip, null,
+                            sheets, res.printed * copies, color, res.total)
+                    }
                     else -> {
                         statusTv.text = when {
                             job.isBlocked -> "Printer needs attention: paper, ink or cover?$tag"
@@ -1068,8 +1287,11 @@ class MainActivity : Activity(), PrintQueue.Listener {
         statusTv.text = "Checking ${files.size} file${if (files.size == 1) "" else "s"}…"
         bg {
             val checked = files.map { u ->
-                val det = if (PdfTools.isPdf(this, u)) (try { PdfTools.detect(this, u)?.paper } catch (e: Exception) { null }) else null
-                Triple(u, nameOf(u), det)
+                val name = nameOf(u)
+                // Copy each file into the app so the queue can still read it later (and after a failure).
+                val staged = Resume.stage(this, listOf(u), listOf(name)).first()
+                val det = if (PdfTools.isPdf(this, staged)) (try { PdfTools.detect(this, staged)?.paper } catch (e: Exception) { null }) else null
+                Triple(staged, name, det)
             }
             ui.post { askPapers(checked, 0, base, copies, quality, 0) }
         }
@@ -1095,7 +1317,7 @@ class MainActivity : Activity(), PrintQueue.Listener {
                 .setPositiveButton(det.label) { _, _ -> add(det) }
                 .setNegativeButton(base.paper.label) { _, _ -> add(base.paper) }
                 .setNeutralButton("Don't add") { _, _ -> askPapers(list, i + 1, base, copies, quality, added) }
-                .show()
+                .safeShow()
         } else {
             add(base.paper)
         }
@@ -1173,16 +1395,23 @@ class MainActivity : Activity(), PrintQueue.Listener {
     }
 
     private fun confirmRequeue(it: QItem) {
-        AlertDialog.Builder(this)
+        val from = it.resumeFrom
+        val go = { resume: Boolean ->
+            PrintQueue.requeue(it, resume)
+            if (!PrintQueue.running && PrintQueue.waitingFor == null && ip.isNotEmpty()) PrintQueue.start(this, ip)
+        }
+        val b = AlertDialog.Builder(this)
             .setTitle("Print \"${it.name}\" again?")
-            .setMessage("It goes back in the queue with the same settings. Check the output tray first: " +
-                "some pages may have printed last time.")
-            .setPositiveButton("Print again") { _, _ ->
-                PrintQueue.requeue(it)
-                if (!PrintQueue.running && PrintQueue.waitingFor == null && ip.isNotEmpty()) PrintQueue.start(this, ip)
-            }
+            .setMessage(if (from > 0) "Sheets 1–$from already printed. Resume prints only the rest; Start over prints everything."
+                else "It goes back in the queue with the same settings. Check the output tray first.")
             .setNegativeButton("Cancel", null)
-            .show()
+        if (from > 0) {
+            b.setPositiveButton("Resume from sheet ${from + 1}") { _, _ -> go(true) }
+            b.setNeutralButton("Start over") { _, _ -> go(false) }
+        } else {
+            b.setPositiveButton("Print again") { _, _ -> go(false) }
+        }
+        b.safeShow()
     }
 
     /** Asks what to do with a failed or unclear queue job. The queue waits until you answer. */
@@ -1195,16 +1424,19 @@ class MainActivity : Activity(), PrintQueue.Listener {
             b.setTitle("Did job $pos of $total print?")
                 .setMessage("${item.name}\n\n${item.msg}\n\nCheck the output tray. Did all its pages come out?")
                 .setPositiveButton("Yes, it printed") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.PRINTED) }
-                .setNeutralButton("No, print it again") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.RETRY) }
+            if (item.resumeFrom > 0) b.setNeutralButton("No, print the rest") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.RESUME) }
+            else b.setNeutralButton("No, print it again") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.RETRY) }
+            b
                 .setNegativeButton("No, skip it") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.SKIP) }
         } else {
             b.setTitle("Job $pos of $total failed")
                 .setMessage("${item.name}\n\n${item.msg}\n\nFix the problem on the printer, then choose what to do.")
-                .setPositiveButton("Retry this job") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.RETRY) }
-                .setNeutralButton("Stop the queue") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.STOP) }
+            if (item.resumeFrom > 0) b.setPositiveButton("Resume from sheet ${item.resumeFrom + 1}") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.RESUME) }
+            else b.setPositiveButton("Retry this job") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.RETRY) }
+            b.setNeutralButton("Stop the queue") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.STOP) }
                 .setNegativeButton("Skip it, go on") { _, _ -> PrintQueue.decide(item, PrintQueue.Decision.SKIP) }
         }
-        decisionDlg = b.show()
+        decisionDlg = b.safeShow()
     }
 
     // ---------------------------------------------------------------- scanning
@@ -1222,12 +1454,12 @@ class MainActivity : Activity(), PrintQueue.Listener {
         }
         val color = scanColorSp.selectedItemPosition == 0
         val dpi = intArrayOf(150, 300, 600)[scanDpiSp.selectedItemPosition]
-        val target = ip
         scanBtn.isEnabled = false
         scanInfo.text = "Scanning… (page face down on the glass)"
         bg {
             try {
-                val b = Escl.scan(target, Net.wifi(this), color, dpi)
+                val at = locate { m -> ui.post { scanInfo.text = m } } ?: throw Exception("Can't find the printer on this Wi-Fi")
+                val b = Escl.scan(at, Net.forIp(this, at), color, dpi)
                 ui.post {
                     scans.add(b)
                     scanBtn.isEnabled = true

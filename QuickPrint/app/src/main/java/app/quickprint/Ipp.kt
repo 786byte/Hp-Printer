@@ -25,8 +25,11 @@ data class Caps(
     val urf: List<String>
 )
 
-/** state: 3 pending, 4 held, 5 printing, 6 stopped, 7 cancelled, 8 aborted, 9 completed, -1 job no longer listed */
-data class JobState(val state: Int, val reasons: List<String>)
+/**
+ * state: 3 pending, 4 held, 5 printing, 6 stopped, 7 cancelled, 8 aborted, 9 completed, -1 job no longer listed.
+ * done: sheets the printer says it has finished for this job, -1 if it doesn't say.
+ */
+data class JobState(val state: Int, val reasons: List<String>, val done: Int = -1)
 
 class IppException(msg: String) : Exception(msg)
 
@@ -126,7 +129,7 @@ object Ipp {
 
     private fun send(ip: String, net: Network?, path: String, body: ByteArray, doc: File?, readTimeout: Int): Resp {
         val c = Http.open("http://$ip:631$path", net)
-        c.connectTimeout = 4000
+        c.connectTimeout = 7000
         c.readTimeout = readTimeout
         c.requestMethod = "POST"
         c.doOutput = true
@@ -155,7 +158,7 @@ object Ipp {
             try {
                 val w = W()
                 build(w, p)
-                val r = send(ip, net, p, w.bytes(), null, 8000)
+                val r = send(ip, net, p, w.bytes(), null, 10000)
                 if (r.status >= 0x0400) {
                     last = IppException(describe(r.status))
                     continue
@@ -281,10 +284,12 @@ object Ipp {
         base(w, ip, p)
         w.i(0x21, "job-id", id)
         w.s(0x42, "requesting-user-name", "QuickPrint")
-        w.req(listOf("job-state", "job-state-reasons"))
-        val r = send(ip, net, p, w.bytes(), null, 6000)
+        w.req(listOf("job-state", "job-state-reasons", "job-impressions-completed", "job-media-sheets-completed"))
+        val r = send(ip, net, p, w.bytes(), null, 8000)
         if (r.status == 0x0406) return JobState(-1, emptyList())
         if (r.status >= 0x0400) throw IppException(describe(r.status))
-        return JobState(r.first("job-state")?.int() ?: 0, r.all("job-state-reasons").map { it.str() })
+        val impressions = r.first("job-impressions-completed")?.takeIf { it.b.size == 4 }?.int() ?: -1
+        val sheets = r.first("job-media-sheets-completed")?.takeIf { it.b.size == 4 }?.int() ?: -1
+        return JobState(r.first("job-state")?.int() ?: 0, r.all("job-state-reasons").map { it.str() }, maxOf(impressions, sheets))
     }
 }

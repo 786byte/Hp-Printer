@@ -47,6 +47,9 @@ class Prepared(
     private val closers: List<() -> Unit>
 ) {
     fun draw(c: Canvas, sheet: Int) = drawFn(c, sheet)
+
+    /** The sheets to send, in order: every copy of [order], minus the first [skip] that already printed. */
+    fun sequence(copies: Int, skip: Int): List<Int> = List(maxOf(1, copies)) { order }.flatten().drop(maxOf(0, skip))
     fun close() {
         for (cl in closers) {
             try { cl() } catch (e: Exception) { }
@@ -78,7 +81,9 @@ data class Opts(
     val evenRev: Boolean = true,
     val shortEdge: Boolean = false,
     val evenPad: Boolean = false,
-    val turnBacks: Boolean = false
+    val turnBacks: Boolean = false,
+    /** Resume: skip this many sheets of the job (copies included) because they already printed. */
+    val skip: Int = 0
 )
 
 class BuildResult(val printed: Int, val total: Int)
@@ -272,7 +277,7 @@ object PdfTools {
             }
             if (srcs.isEmpty()) throw Exception("No pages selected")
 
-            val plain = o.pages == 0 && o.nup == 1 && !o.gray && o.zoom == 1f && !o.trim && !o.border
+            val plain = o.pages == 0 && o.nup == 1 && !o.gray && o.zoom == 1f && !o.trim && !o.border && o.skip == 0
             val original = if (plain) singlePdf else null
 
             val w = if (o.landscape) o.paper.h else o.paper.w
@@ -341,16 +346,18 @@ object PdfTools {
     }
 
     /** For the Android print screen. */
-    fun writePdf(p: Prepared, out: File, progress: (Int, Int) -> Unit) {
+    fun writePdf(p: Prepared, out: File, skip: Int, progress: (Int, Int) -> Unit) {
         val orig = p.original
-        if (orig != null) {
+        if (orig != null && skip == 0) {
             orig.copyTo(out, overwrite = true)
             return
         }
         val doc = PdfDocument()
+        val seq = p.sequence(1, skip)
+        if (seq.isEmpty()) throw Exception("Nothing left to print")
         try {
-            for ((n, s) in p.order.withIndex()) {
-                progress(n + 1, p.order.size)
+            for ((n, s) in seq.withIndex()) {
+                progress(n + 1, seq.size)
                 val page = doc.startPage(PdfDocument.PageInfo.Builder(p.w, p.h, n + 1).create())
                 p.draw(page.canvas, s)
                 doc.finishPage(page)
@@ -364,7 +371,7 @@ object PdfTools {
     /** For sending straight to the printer. Landscape sheets are turned so the paper feeds normally. */
     fun writeRaster(
         p: Prepared, out: File, pwg: Boolean, dpi: Int, gray: Boolean, quality: Int,
-        copies: Int, sizeName: String, progress: (Int, Int) -> Unit
+        copies: Int, skip: Int, sizeName: String, progress: (Int, Int) -> Unit
     ) {
         val land = p.w > p.h
         val wPt = min(p.w, p.h)
@@ -372,26 +379,24 @@ object PdfTools {
         val pxW = Math.round(wPt * dpi / 72f)
         val pxH = Math.round(hPt * dpi / 72f)
         val k = dpi / 72f
-        val totalPages = p.order.size * copies
+        val seq = p.sequence(copies, skip)
+        if (seq.isEmpty()) throw Exception("Nothing left to print")
+        val totalPages = seq.size
         val bmp = Bitmap.createBitmap(pxW, pxH, Bitmap.Config.ARGB_8888)
         try {
             java.io.BufferedOutputStream(out.outputStream(), 256 * 1024).use { os ->
                 val rw = RasterWriter(os, pwg, totalPages)
-                var n = 0
-                repeat(copies) {
-                    for (s in p.order) {
-                        n++
-                        progress(n, totalPages)
-                        val c = Canvas(bmp)
-                        c.drawColor(Color.WHITE)
-                        if (land) {
-                            c.translate(pxW.toFloat(), 0f)
-                            c.rotate(90f)
-                        }
-                        c.scale(k, k)
-                        p.draw(c, s)
-                        rw.page(bmp, gray, dpi, wPt, hPt, sizeName, quality, totalPages)
+                for ((i, s) in seq.withIndex()) {
+                    progress(i + 1, totalPages)
+                    val c = Canvas(bmp)
+                    c.drawColor(Color.WHITE)
+                    if (land) {
+                        c.translate(pxW.toFloat(), 0f)
+                        c.rotate(90f)
                     }
+                    c.scale(k, k)
+                    p.draw(c, s)
+                    rw.page(bmp, gray, dpi, wPt, hPt, sizeName, quality, totalPages)
                 }
             }
         } finally {

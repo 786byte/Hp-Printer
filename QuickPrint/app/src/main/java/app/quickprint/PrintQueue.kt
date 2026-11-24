@@ -27,6 +27,13 @@ class QItem(
     var msg = ""
     var sheets = 0
     var color = true
+    /** Sheets already printed in earlier attempts — a resume leaves them out. */
+    var skip = 0
+    /** Sheets the printer confirmed in the latest attempt. */
+    var printed = 0
+    /** Sheets in the latest attempt (0 = unknown). */
+    var sent = 0
+    val resumeFrom: Int get() = skip + printed
 }
 
 /**
@@ -42,7 +49,7 @@ object PrintQueue {
         fun onDecisionNeeded(item: QItem)
     }
 
-    enum class Decision { RETRY, SKIP, STOP, PRINTED }
+    enum class Decision { RESUME, RETRY, SKIP, STOP, PRINTED }
 
     private val ui = Handler(Looper.getMainLooper())
     private var nextId = 1
@@ -96,13 +103,20 @@ object PrintQueue {
         changed()
     }
 
-    /** You chose to print a failed / unclear job again (from its row). Puts it back in line. */
-    fun requeue(item: QItem) {
+    /** You chose to print a failed / unclear job again (from its row). [resume] = only the sheets not yet printed. */
+    fun requeue(item: QItem, resume: Boolean) {
         if (item.state != QState.FAILED && item.state != QState.UNCLEAR) return
-        if (item === waitingFor) { decide(item, Decision.RETRY); return }
-        item.state = QState.WAITING
-        item.msg = "Will print again"
+        if (item === waitingFor) { decide(item, if (resume) Decision.RESUME else Decision.RETRY); return }
+        again(item, resume)
         changed()
+    }
+
+    private fun again(item: QItem, resume: Boolean) {
+        item.skip = if (resume) item.resumeFrom else 0
+        item.printed = 0
+        item.sent = 0
+        item.state = QState.WAITING
+        item.msg = if (item.skip > 0) "Will resume from sheet ${item.skip + 1}" else "Will print again"
     }
 
     /** Your answer to [Listener.onDecisionNeeded]. */
@@ -110,7 +124,8 @@ object PrintQueue {
         if (item !== waitingFor) return
         waitingFor = null
         when (d) {
-            Decision.RETRY -> { item.state = QState.WAITING; item.msg = "Will print again" }
+            Decision.RESUME -> again(item, true)
+            Decision.RETRY -> again(item, false)
             Decision.SKIP -> { if (item.state == QState.UNCLEAR) { item.state = QState.SKIPPED; item.msg = "You said it didn't print — skipped" } }
             Decision.PRINTED -> { item.state = QState.DONE; item.msg = "You confirmed it printed"; count(item) }
             Decision.STOP -> { running = false; changed(); return }
@@ -135,14 +150,24 @@ object PrintQueue {
         item.state = QState.WORKING
         item.msg = "Starting…"
         changed()
-        val target = ip
+        val opts = item.opts.copy(skip = item.skip)
+        val from = if (item.skip > 0) " (from sheet ${item.skip + 1})" else ""
         Thread {
             val out = try {
-                DirectPrint.run(ctx, target, item.uris, item.opts, item.copies, item.quality, item.detected, "Quick Print — ${item.name}") { m ->
-                    ui.post { item.msg = m; changed() }
+                val target = Locator.find(ctx, ip, "") { m -> ui.post { item.msg = m; changed() } }
+                if (target == null) {
+                    Outcome.Failed("Can't find the printer on this Wi-Fi. Connect to the home Wi-Fi or the printer's own Wi-Fi.", true, 0, 0, !opts.gray)
+                } else {
+                    if (target != ip) {
+                        ip = target
+                        ctx.getSharedPreferences("qp", Context.MODE_PRIVATE).edit().putString("ip", target).apply()
+                    }
+                    DirectPrint.run(ctx, target, item.uris, opts, item.copies, item.quality, item.detected,
+                        "Quick Print — ${item.name}", { m -> ui.post { item.msg = m + from; changed() } },
+                        { n -> ui.post { item.printed = n; changed() } })
                 }
             } catch (e: Throwable) {
-                Outcome.Failed(e.message ?: e.javaClass.simpleName, false)
+                Outcome.Failed(e.message ?: e.javaClass.simpleName, false, null, 0, !opts.gray)
             }
             ui.post { finished(item, out) }
         }.start()
@@ -152,9 +177,10 @@ object PrintQueue {
         when (out) {
             is Outcome.Done -> {
                 item.state = QState.DONE
-                item.sheets = out.sheets
+                item.sheets = out.inked
                 item.color = out.color
-                item.msg = "${out.sheets} page${if (out.sheets == 1) "" else "s"} printed"
+                val all = item.skip + out.sent
+                item.msg = "$all sheet${if (all == 1) "" else "s"} printed" + if (item.skip > 0) " (resumed)" else ""
                 count(item)
                 runNext()
             }
@@ -163,12 +189,25 @@ object PrintQueue {
                 item.msg = "Cancelled on the printer"
                 runNext()
             }
-            is Outcome.Failed -> pause(item, QState.FAILED, out.why +
-                if (out.nothingSent) " Nothing was printed." else " Some pages may have printed.")
-            is Outcome.Unclear -> {
-                item.sheets = out.sheets
+            is Outcome.Failed -> {
+                item.printed = out.printed ?: 0
+                item.sent = out.sent
                 item.color = out.color
-                pause(item, QState.UNCLEAR, out.why)
+                app?.let { if (item.printed > 0) Stats.add(it, item.printed, out.color) }
+                val total = item.skip + out.sent
+                pause(item, QState.FAILED, out.why + " " + when {
+                    out.printed == null -> "The printer didn't say how many sheets came out — check the tray."
+                    item.resumeFrom > 0 -> "Sheets 1–${item.resumeFrom} of $total are printed."
+                    else -> "Nothing was printed."
+                })
+            }
+            is Outcome.Unclear -> {
+                item.printed = out.printed ?: 0
+                item.sent = out.sent
+                item.sheets = out.inked
+                item.color = out.color
+                pause(item, QState.UNCLEAR, out.why + if (out.printed != null)
+                    " The printer last confirmed ${item.resumeFrom} of ${item.skip + out.sent} sheets." else "")
             }
             is Outcome.NoDirect -> pause(item, QState.FAILED,
                 "This printer doesn't accept direct jobs, so the queue can't print it. Use Print with \"Android print screen\".")
